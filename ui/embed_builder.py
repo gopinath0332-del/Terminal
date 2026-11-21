@@ -1,13 +1,17 @@
 """
 ui/embed_builder.py
 ===================
-Renders rich, color-coded Discord Embeds for the live algo monitor dashboard.
+Renders rich, color-coded Exchange-Wise Discord Embeds:
+1. Zerodha (Stock Holdings + F&O Derivatives + MCX Commodities)
+2. Delta Exchange - Futures Account
+3. Delta Exchange - Options Account
+4. Algo Daemons Telemetry (Systemd + Pi Health)
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Tuple
+from typing import List
 
 import discord
 
@@ -33,44 +37,45 @@ def _format_currency(val: float, currency_sym: str = "₹") -> str:
 
 
 class DashboardEmbedBuilder:
-    """Constructs the master live dashboard Discord Embed."""
+    """Constructs the Exchange-Wise master live dashboard Discord Embed."""
 
     @staticmethod
     def build(snapshot: DashboardSnapshot) -> discord.Embed:
+        z = snapshot.zerodha
+        d_fut = snapshot.delta_futures
+        d_opt = snapshot.delta_options
+        sys = snapshot.system
+
         # Determine overall color
         color = 0x00C851  # Emerald Green
         if (
-            snapshot.zerodha.error
-            or snapshot.delta_futures.error
-            or snapshot.delta_options.error
-            or snapshot.zerodha.nifty_strike_status.status == "failed"
-            or snapshot.delta_futures.service_status.status == "failed"
-            or snapshot.delta_options.service_status.status == "failed"
+            z.error
+            or d_fut.error
+            or d_opt.error
+            or z.nifty_strike_status.status == "failed"
+            or d_fut.service_status.status == "failed"
+            or d_opt.service_status.status == "failed"
         ):
             color = 0xFF4444  # Red Alert
-        elif (
-            snapshot.zerodha.intraday_pnl < 0
-            or (snapshot.delta_futures.unrealized_pnl + snapshot.delta_options.unrealized_pnl) < 0
-        ):
+        elif (z.intraday_mtm < 0) or ((d_fut.unrealized_pnl + d_opt.unrealized_pnl) < 0):
             color = 0xFFBB33  # Amber / Warning
 
         ist_time_str = snapshot.timestamp.strftime("%H:%M:%S IST")
         date_str = snapshot.timestamp.strftime("%d %b %Y")
 
         embed = discord.Embed(
-            title="📊 ALGO TRADING PRODUCTION MONITOR",
+            title="📊 LIVE EXCHANGE ALGO MONITOR",
             description=f"**Node:** Raspberry Pi 5 • **Date:** {date_str} • **Live Sync:** {ist_time_str}",
             color=color,
             timestamp=snapshot.timestamp,
         )
 
         # -------------------------------------------------------------
-        # System Hardware Bar
+        # System Hardware Telemetry
         # -------------------------------------------------------------
-        sys = snapshot.system
         temp_str = f"{sys.temperature_c:.1f}°C" if sys.temperature_c is not None else "N/A"
         embed.add_field(
-            name="🖥️ System Hardware Telemetry",
+            name="🖥️ Raspberry Pi Telemetry",
             value=(
                 f"**CPU:** `{sys.cpu_percent:.1f}%`  |  "
                 f"**RAM:** `{sys.ram_used_gb}/{sys.ram_total_gb} GB ({sys.ram_percent}%)`  |  "
@@ -81,129 +86,150 @@ class DashboardEmbedBuilder:
         )
 
         # -------------------------------------------------------------
-        # 1. NIFTY STRIKE ENGINE (Zerodha)
+        # 1. ZERODHA (Holdings + F&O + MCX Commodities)
         # -------------------------------------------------------------
-        z = snapshot.zerodha
-        ns_dot = _status_dot(z.nifty_strike_status)
-        strike_positions = [
-            p for p in z.open_positions if "NIFTY" in p.symbol.upper() and p.product_type != "CNC"
-        ]
+        zerodha_sections: List[str] = []
 
-        if strike_positions:
-            pos_lines = []
-            for sp in strike_positions:
-                pnl_str = _format_currency(sp.pnl, "₹")
-                pos_lines.append(
-                    f"• **{sp.side} {sp.quantity:.0f}x {sp.symbol}**\n"
-                    f"  Entry: ₹{sp.entry_price:,.1f} ➔ LTP: ₹{sp.current_price:,.1f} ({pnl_str})"
-                )
-            strike_details = "\n".join(pos_lines)
-        elif not z.is_authenticated:
-            strike_details = f"⚠️ *Auth Pending / Access token not active*"
+        if not z.is_authenticated:
+            zerodha_sections.append(f"⚠️ *Kite auth pending: {z.error or 'Waiting for token refresh'}*")
         else:
-            strike_details = "• No open intraday position (Monitoring 5m candles)"
-
-        embed.add_field(
-            name=f"1️⃣ Nifty Strike Engine (Zerodha)  {ns_dot}",
-            value=(
-                f"**Service:** `{z.nifty_strike_status.name}`\n"
-                f"{strike_details}\n"
-                f"**Intraday MTM:** `{_format_currency(z.intraday_pnl, '₹')}`"
-            ),
-            inline=False,
-        )
-
-        # -------------------------------------------------------------
-        # 2. NIFTY 500 PORTFOLIO (Zerodha Swing)
-        # -------------------------------------------------------------
-        np_dot = _status_dot(z.nifty_portfolio_status)
-        embed.add_field(
-            name=f"2️⃣ Nifty 500 Breakout Portfolio (Zerodha)  {np_dot}",
-            value=(
-                f"**Schedule:** Daily at `15:45 IST` (`{z.nifty_portfolio_status.name}`)\n"
-                f"**Active Slots:** `{z.portfolio_slots_used}/{z.portfolio_max_slots}` stocks\n"
-                f"**Portfolio Unrealized:** `{_format_currency(z.portfolio_unrealized_pnl, '₹')}`  |  "
-                f"**Cash:** `₹{z.available_margin:,.2f}`"
-            ),
-            inline=False,
-        )
-
-        # -------------------------------------------------------------
-        # 3. DELTA SHORT STRADDLE (Delta Options)
-        # -------------------------------------------------------------
-        d_opt = snapshot.delta_options
-        d_opt_dot = _status_dot(d_opt.service_status)
-        mode_badge = "🧪 TESTNET" if d_opt.is_testnet else "⚡ LIVE"
-
-        if d_opt.open_positions:
-            opt_lines = []
-            for op in d_opt.open_positions:
-                pnl_str = _format_currency(op.pnl, "$")
-                opt_lines.append(
-                    f"• **{op.side} {op.quantity:.0f}x {op.symbol}** ({pnl_str})"
+            # 1A. Stock Holdings
+            if z.holdings:
+                h_pnl_str = _format_currency(z.holdings_total_pnl, "₹")
+                h_day_str = _format_currency(z.holdings_day_pnl, "₹")
+                zerodha_sections.append(
+                    f"📦 **Stock Holdings ({len(z.holdings)} stocks):**\n"
+                    f"  Value: `₹{z.holdings_current_value:,.2f}` | P&L: `{h_pnl_str}` (Today: `{h_day_str}`)"
                 )
-            opt_details = "\n".join(opt_lines)
-        elif not d_opt.is_authenticated:
-            opt_details = f"⚠️ *Check API keys in {d_opt.account_label}*"
+            else:
+                zerodha_sections.append("📦 **Stock Holdings:** No active CNC stocks")
+
+            # 1B. F&O Positions (Options & Index Futures)
+            if z.fno_positions:
+                fno_lines = []
+                for p in z.fno_positions:
+                    pnl_str = _format_currency(p.pnl, "₹")
+                    fno_lines.append(
+                        f"  • **{p.side} {p.quantity:.0f}x {p.symbol}** ➔ `{pnl_str}` (LTP: ₹{p.current_price:,.1f})"
+                    )
+                zerodha_sections.append("📈 **F&O Derivatives:**\n" + "\n".join(fno_lines))
+            else:
+                zerodha_sections.append("📈 **F&O Derivatives:** None active")
+
+            # 1C. Commodity Positions (MCX Futures - Gold, Crude, Silver)
+            if z.commodity_positions:
+                comm_lines = []
+                for p in z.commodity_positions:
+                    pnl_str = _format_currency(p.pnl, "₹")
+                    comm_lines.append(
+                        f"  • **{p.side} {p.quantity:.0f}x {p.symbol}** ➔ `{pnl_str}` (LTP: ₹{p.current_price:,.1f})"
+                    )
+                zerodha_sections.append("🪙 **MCX Commodities:**\n" + "\n".join(comm_lines))
+            else:
+                zerodha_sections.append("🪙 **MCX Commodities:** None active")
+
+            # 1D. Totals & Margins
+            mtm_str = _format_currency(z.intraday_mtm, "₹")
+            realized_str = _format_currency(z.realized_pnl, "₹")
+            zerodha_sections.append(
+                f"💵 **Intraday MTM:** `{mtm_str}` | **Realized:** `{realized_str}`\n"
+                f"💳 **Available Margin:** Equity: `₹{z.available_margin:,.2f}` | Commodity: `₹{z.commodity_margin:,.2f}`"
+            )
+
+        embed.add_field(
+            name="🇮🇳 ZERODHA (Equity Holdings • F&O Options • MCX Commodities)",
+            value="\n".join(zerodha_sections),
+            inline=False,
+        )
+
+        # -------------------------------------------------------------
+        # 2. DELTA EXCHANGE — FUTURES ACCOUNT
+        # -------------------------------------------------------------
+        fut_sections: List[str] = []
+        fut_mode = "🧪 TESTNET" if d_fut.is_testnet else "⚡ LIVE"
+
+        if not d_fut.is_authenticated:
+            fut_sections.append(f"⚠️ *API Error: {d_fut.error or 'Check delta-exchange-alog/.env'}*")
         else:
-            opt_details = "• No active straddle (Scheduled entry: 17:00 IST)"
+            if d_fut.open_positions:
+                for p in d_fut.open_positions:
+                    pnl_str = _format_currency(p.pnl, "$")
+                    fut_sections.append(
+                        f"• **{p.side} {p.quantity} {p.symbol}** ➔ `{pnl_str}` (Mark: ${p.current_price:,.2f})"
+                    )
+            else:
+                fut_sections.append("• No open futures contracts")
+
+            fut_mtm_str = _format_currency(d_fut.unrealized_pnl, "$")
+            fut_sections.append(
+                f"**Futures MTM:** `{fut_mtm_str}` | **Wallet Equity:** `${d_fut.wallet_equity:,.2f}` (Avail: `${d_fut.available_balance:,.2f}`)"
+            )
 
         embed.add_field(
-            name=f"3️⃣ Delta Short Straddle ({mode_badge})  {d_opt_dot}",
-            value=(
-                f"**Service:** `{d_opt.service_status.name}`\n"
-                f"{opt_details}\n"
-                f"**Options MTM:** `{_format_currency(d_opt.unrealized_pnl, '$')}`  |  "
-                f"**Wallet Equity:** `${d_opt.wallet_equity:,.2f}`"
-            ),
+            name=f"🌐 DELTA EXCHANGE — FUTURES ACCOUNT ({fut_mode})",
+            value="\n".join(fut_sections),
             inline=False,
         )
 
         # -------------------------------------------------------------
-        # 4. DELTA CRYPTO FUTURES (Delta Multi-Strategy)
+        # 3. DELTA EXCHANGE — OPTIONS ACCOUNT
         # -------------------------------------------------------------
-        d_fut = snapshot.delta_futures
-        d_fut_dot = _status_dot(d_fut.service_status)
-        fut_mode_badge = "🧪 TESTNET" if d_fut.is_testnet else "⚡ LIVE"
+        opt_sections: List[str] = []
+        opt_mode = "🧪 TESTNET" if d_opt.is_testnet else "⚡ LIVE"
 
-        if d_fut.open_positions:
-            fut_lines = []
-            for fp in d_fut.open_positions:
-                pnl_str = _format_currency(fp.pnl, "$")
-                fut_lines.append(
-                    f"• **{fp.side} {fp.quantity} {fp.symbol}** ➔ `{pnl_str}`"
-                )
-            fut_details = "\n".join(fut_lines)
-        elif not d_fut.is_authenticated:
-            fut_details = f"⚠️ *Check API keys in {d_fut.account_label}*"
+        if not d_opt.is_authenticated:
+            opt_sections.append(f"⚠️ *API Error: {d_opt.error or 'Check opt-algo/.env'}*")
         else:
-            fut_details = "• No open futures positions (Scanning multi-coins)"
+            if d_opt.open_positions:
+                for p in d_opt.open_positions:
+                    pnl_str = _format_currency(p.pnl, "$")
+                    opt_sections.append(
+                        f"• **{p.side} {p.quantity:.0f}x {p.symbol}** ➔ `{pnl_str}`"
+                    )
+            else:
+                opt_sections.append("• No active options positions (Daily Straddle scheduled @ 17:00 IST)")
+
+            opt_mtm_str = _format_currency(d_opt.unrealized_pnl, "$")
+            opt_sections.append(
+                f"**Options MTM:** `{opt_mtm_str}` | **Wallet Equity:** `${d_opt.wallet_equity:,.2f}` (Avail: `${d_opt.available_balance:,.2f}`)"
+            )
 
         embed.add_field(
-            name=f"4️⃣ Delta Crypto Futures ({fut_mode_badge})  {d_fut_dot}",
+            name=f"🌐 DELTA EXCHANGE — OPTIONS ACCOUNT ({opt_mode})",
+            value="\n".join(opt_sections),
+            inline=False,
+        )
+
+        # -------------------------------------------------------------
+        # 4. ALGO DAEMONS STATUS
+        # -------------------------------------------------------------
+        embed.add_field(
+            name="🤖 Background Algo Daemons (Systemd)",
             value=(
-                f"**Service:** `{d_fut.service_status.name}`\n"
-                f"{fut_details}\n"
-                f"**Futures MTM:** `{_format_currency(d_fut.unrealized_pnl, '$')}`  |  "
-                f"**Wallet Equity:** `${d_fut.wallet_equity:,.2f}`"
+                f"• **Nifty Strike Engine:** {_status_dot(z.nifty_strike_status)}  |  "
+                f"**Nifty Portfolio:** {_status_dot(z.nifty_portfolio_status)}\n"
+                f"• **Delta Futures:** {_status_dot(d_fut.service_status)}  |  "
+                f"**Delta Options:** {_status_dot(d_opt.service_status)}"
             ),
             inline=False,
         )
 
         # -------------------------------------------------------------
-        # 5. Combined Financial Summary Footer
+        # 5. Combined Financial Summary
         # -------------------------------------------------------------
-        total_inr = z.intraday_pnl + z.portfolio_unrealized_pnl
-        total_usd = d_opt.unrealized_pnl + d_fut.unrealized_pnl
+        total_inr_intraday = z.intraday_mtm + z.realized_pnl
+        total_usd_mtm = d_fut.unrealized_pnl + d_opt.unrealized_pnl
 
         embed.add_field(
-            name="💰 COMBINED TOTAL P&L TODAY",
+            name="💰 COMBINED REAL-TIME P&L SUMMARY",
             value=(
-                f"🇮🇳 **Indian Markets (NSE):** `{_format_currency(total_inr, '₹')}`\n"
-                f"🌐 **Crypto Markets (Delta):** `{_format_currency(total_usd, '$')}`"
+                f"🇮🇳 **Zerodha Intraday P&L:** `{_format_currency(total_inr_intraday, '₹')}`  "
+                f"*(Holdings Total P&L: {_format_currency(z.holdings_total_pnl, '₹')})*\n"
+                f"🌐 **Delta Exchange P&L:** `{_format_currency(total_usd_mtm, '$')}` "
+                f"*(Futures: {_format_currency(d_fut.unrealized_pnl, '$')}, Options: {_format_currency(d_opt.unrealized_pnl, '$')})*"
             ),
             inline=False,
         )
 
-        embed.set_footer(text="Auto-updating live in-place • Click buttons below for instant action")
+        embed.set_footer(text="Exchange-Wise Live Feed • Updates in-place every 20s")
         return embed

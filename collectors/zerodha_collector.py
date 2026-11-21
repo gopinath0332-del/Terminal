@@ -1,8 +1,11 @@
 """
 collectors/zerodha_collector.py
 ===============================
-Fetches live positions, margins, and P&L from Zerodha Kite Connect,
-and reads portfolio state from nifty-portfolio engine.
+Fetches comprehensive Zerodha Exchange data:
+1. Stock Holdings (Equity Cash / Swing Portfolio)
+2. F&O Derivatives Positions (Nifty/BankNifty Options & Index Futures)
+3. MCX Commodity Futures Positions (Gold, Crude Oil, Silver, etc.)
+4. Margins for Equity & Commodity segments
 """
 
 from __future__ import annotations
@@ -12,9 +15,14 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from collectors.base import PositionItem, ServiceHealth, ZerodhaData
+from collectors.base import HoldingItem, PositionItem, ZerodhaData
 
 logger = logging.getLogger(__name__)
+
+COMMODITY_SYMBOLS = {
+    "GOLD", "GOLDPETAL", "GOLDM", "SILVER", "SILVERM", "SILVERMIC",
+    "CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATURALGASM", "COPPER", "ZINC", "LEAD", "ALUMINIUM"
+}
 
 
 class ZerodhaCollector:
@@ -41,98 +49,164 @@ class ZerodhaCollector:
             self._kite = None
 
     def update_credentials(self, api_key: str, access_token: str) -> None:
-        """Update credentials dynamically (e.g. after daily auto-login refreshes token)."""
         if api_key != self.api_key or access_token != self.access_token:
             self.api_key = api_key
             self.access_token = access_token
             self._init_client()
 
     def collect(self) -> ZerodhaData:
-        """Collect current Zerodha trading status and open positions."""
         data = ZerodhaData()
 
-        # 1. Check local Nifty Portfolio state file
-        self._read_portfolio_state(data)
-
-        # 2. Query Kite API if initialized
         if not self._kite:
             data.is_authenticated = False
             data.error = "Kite access token missing or not refreshed yet"
+            self._read_portfolio_state_fallback(data)
             return data
 
         try:
-            # Query Margins
+            # 1. Fetch Margins (Equity & Commodity)
             try:
-                margins = self._kite.margins(segment="equity")
-                available_cash = (
-                    margins.get("net", 0.0)
-                    or margins.get("available", {}).get("live_balance", 0.0)
-                    or margins.get("available", {}).get("cash", 0.0)
-                )
-                data.available_margin = float(available_cash)
-            except Exception as e:
-                logger.warning(f"Could not fetch Zerodha margins: {e}")
+                margin_resp = self._kite.margins()
+                eq_margin = margin_resp.get("equity", {})
+                comm_margin = margin_resp.get("commodity", {})
 
-            # Query Positions
+                data.available_margin = float(
+                    eq_margin.get("net", 0.0)
+                    or eq_margin.get("available", {}).get("live_balance", 0.0)
+                    or 0.0
+                )
+                data.commodity_margin = float(
+                    comm_margin.get("net", 0.0)
+                    or comm_margin.get("available", {}).get("live_balance", 0.0)
+                    or 0.0
+                )
+            except Exception as e:
+                logger.warning(f"Failed to fetch Zerodha margins: {e}")
+
+            # 2. Fetch Stock Holdings (Equity Cash / Swing Portfolio)
+            try:
+                holdings_resp = self._kite.holdings()
+                total_invested = 0.0
+                total_current_val = 0.0
+                total_pnl = 0.0
+                day_pnl = 0.0
+                holding_items: List[HoldingItem] = []
+
+                for h in holdings_resp:
+                    qty = float(h.get("quantity", 0) or 0)
+                    t1_qty = float(h.get("t1_quantity", 0) or 0)
+                    total_qty = qty + t1_qty
+                    if total_qty <= 0:
+                        continue
+
+                    avg_price = float(h.get("average_price", 0.0) or 0.0)
+                    last_price = float(h.get("last_price", 0.0) or 0.0)
+                    h_pnl = float(h.get("pnl", 0.0) or 0.0)
+                    h_day_change = float(h.get("day_change", 0.0) or 0.0)
+                    h_day_pnl = round(h_day_change * total_qty, 2)
+
+                    cost = total_qty * avg_price
+                    curr_val = total_qty * last_price
+                    pnl_pct = (h_pnl / cost * 100.0) if cost > 0 else 0.0
+
+                    total_invested += cost
+                    total_current_val += curr_val
+                    total_pnl += h_pnl
+                    day_pnl += h_day_pnl
+
+                    holding_items.append(
+                        HoldingItem(
+                            symbol=h.get("tradingsymbol", ""),
+                            quantity=total_qty,
+                            average_price=avg_price,
+                            last_price=last_price,
+                            pnl=round(h_pnl, 2),
+                            pnl_pct=round(pnl_pct, 2),
+                            invested_amount=round(cost, 2),
+                            current_value=round(curr_val, 2),
+                        )
+                    )
+
+                data.holdings = holding_items
+                data.holdings_total_investment = round(total_invested, 2)
+                data.holdings_current_value = round(total_current_val, 2)
+                data.holdings_total_pnl = round(total_pnl, 2)
+                data.holdings_day_pnl = round(day_pnl, 2)
+
+            except Exception as e:
+                logger.warning(f"Failed to fetch Zerodha holdings: {e}")
+                self._read_portfolio_state_fallback(data)
+
+            # 3. Fetch Positions & Categorize (F&O vs Commodities vs Equity)
             pos_resp = self._kite.positions()
             net_positions = pos_resp.get("net", [])
-            day_positions = pos_resp.get("day", [])
 
             total_unrealized = 0.0
             total_realized = 0.0
-            open_items: List[PositionItem] = []
 
             for p in net_positions:
-                qty = float(p.get("quantity", 0))
-                pnl = float(p.get("pnl", 0.0))
-                m2m = float(p.get("m2m", 0.0))
-                realized = float(p.get("realised", 0.0))
-                unrealized = float(p.get("unrealised", 0.0))
+                qty = float(p.get("quantity", 0) or 0)
+                pnl = float(p.get("pnl", 0.0) or 0.0)
+                m2m = float(p.get("m2m", 0.0) or 0.0)
+                realized = float(p.get("realised", 0.0) or 0.0)
+                unrealized = float(p.get("unrealised", 0.0) or 0.0)
 
                 total_realized += realized
                 total_unrealized += (m2m if qty != 0 else unrealized)
 
                 if qty != 0:
                     symbol = p.get("tradingsymbol", "")
-                    buy_price = float(p.get("average_price", 0.0))
-                    ltp = float(p.get("last_price", 0.0))
-                    side = "BUY" if qty > 0 else "SELL"
+                    exchange = p.get("exchange", "NSE")
                     product = p.get("product", "MIS")
+                    buy_price = float(p.get("average_price", 0.0) or 0.0)
+                    ltp = float(p.get("last_price", 0.0) or 0.0)
+                    side = "BUY" if qty > 0 else "SELL"
 
                     cost = abs(qty * buy_price)
                     pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
 
-                    open_items.append(
-                        PositionItem(
-                            symbol=symbol,
-                            side=side,
-                            quantity=qty,
-                            entry_price=buy_price,
-                            current_price=ltp,
-                            pnl=pnl,
-                            pnl_pct=round(pnl_pct, 2),
-                            exchange="NSE",
-                            product_type=product,
-                        )
+                    # Determine segment
+                    is_commodity = exchange == "MCX" or any(cs in symbol for cs in COMMODITY_SYMBOLS)
+                    is_fno = exchange in ("NFO", "BFO") or symbol.endswith("CE") or symbol.endswith("PE") or "FUT" in symbol
+
+                    segment = "COMMODITY" if is_commodity else ("OPTIONS" if is_fno else "EQUITY")
+
+                    item = PositionItem(
+                        symbol=symbol,
+                        side=side,
+                        quantity=qty,
+                        entry_price=buy_price,
+                        current_price=ltp,
+                        pnl=round(pnl, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        exchange=exchange,
+                        segment=segment,
+                        product_type=product,
                     )
 
-            data.open_positions = open_items
-            data.unrealized_pnl = round(total_unrealized, 2)
+                    if is_commodity:
+                        data.commodity_positions.append(item)
+                    elif is_fno:
+                        data.fno_positions.append(item)
+                    else:
+                        data.equity_positions.append(item)
+
+            data.intraday_mtm = round(total_unrealized, 2)
             data.realized_pnl = round(total_realized, 2)
-            data.intraday_pnl = round(total_unrealized + total_realized, 2)
-            data.trades_today_count = len(day_positions)
+            data.total_day_pnl = round(total_unrealized + total_realized, 2)
             data.is_authenticated = True
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"Error querying Zerodha Kite API: {err_str}")
+            logger.error(f"Error querying Zerodha Kite: {err_str}")
             data.error = err_str
             data.is_authenticated = False
+            self._read_portfolio_state_fallback(data)
 
         return data
 
-    def _read_portfolio_state(self, data: ZerodhaData) -> None:
-        """Read nifty-portfolio persistent JSON state if present."""
+    def _read_portfolio_state_fallback(self, data: ZerodhaData) -> None:
+        """Fallback reading from local nifty-portfolio persistent JSON state."""
         state_file = self.portfolio_dir / "data" / "portfolio_state.json"
         if not state_file.exists():
             return
@@ -141,13 +215,24 @@ class ZerodhaCollector:
             with open(state_file, "r") as f:
                 content = json.load(f)
                 holdings = content.get("holdings", {})
-                data.portfolio_slots_used = len(holdings)
-                data.portfolio_max_slots = content.get("max_slots", 10)
-
-                # Sum unrealized portfolio pnl if recorded
-                p_pnl = 0.0
-                for _, h in holdings.items():
-                    p_pnl += float(h.get("pnl", 0.0) or 0.0)
-                data.portfolio_unrealized_pnl = round(p_pnl, 2)
+                if not data.holdings and holdings:
+                    p_pnl = 0.0
+                    for sym, h in holdings.items():
+                        qty = float(h.get("shares", 0) or 0)
+                        entry = float(h.get("entry_price", 0.0) or 0.0)
+                        pnl = float(h.get("pnl", 0.0) or 0.0)
+                        p_pnl += pnl
+                        data.holdings.append(
+                            HoldingItem(
+                                symbol=sym,
+                                quantity=qty,
+                                average_price=entry,
+                                last_price=entry,
+                                pnl=pnl,
+                                invested_amount=round(qty * entry, 2),
+                                current_value=round(qty * entry + pnl, 2),
+                            )
+                        )
+                    data.holdings_total_pnl = round(p_pnl, 2)
         except Exception as e:
             logger.debug(f"Could not read portfolio_state.json: {e}")

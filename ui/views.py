@@ -1,7 +1,7 @@
 """
 ui/views.py
 ===========
-Interactive Discord Buttons attached to the live pinned dashboard embed.
+Interactive Discord Buttons attached to the Exchange-Wise live dashboard embed.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class DashboardView(discord.ui.View):
         refresh_callback: Callable[[], Coroutine[Any, Any, DashboardSnapshot]],
         get_latest_snapshot: Callable[[], DashboardSnapshot],
     ):
-        super().__init__(timeout=None)  # Persistent view (never expires)
+        super().__init__(timeout=None)
         self.refresh_callback = refresh_callback
         self.get_latest_snapshot = get_latest_snapshot
 
@@ -35,7 +35,6 @@ class DashboardView(discord.ui.View):
         custom_id="btn_refresh_dashboard",
     )
     async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Immediately trigger fresh data collection and update embed."""
         await interaction.response.defer(ephemeral=True)
         try:
             snapshot = await self.refresh_callback()
@@ -54,37 +53,93 @@ class DashboardView(discord.ui.View):
         custom_id="btn_view_positions",
     )
     async def btn_positions(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Send a detailed markdown breakdown of all open positions (visible only to user)."""
+        """Send a detailed categorized breakdown of all holdings & positions across all exchanges."""
         snapshot = self.get_latest_snapshot()
-        all_positions = []
-        all_positions.extend(snapshot.zerodha.open_positions)
-        all_positions.extend(snapshot.delta_futures.open_positions)
-        all_positions.extend(snapshot.delta_options.open_positions)
+        z = snapshot.zerodha
+        d_fut = snapshot.delta_futures
+        d_opt = snapshot.delta_options
 
-        if not all_positions:
+        lines = ["### 📋 Comprehensive Exchange-Wise Breakdown\n"]
+
+        # 1. Zerodha Holdings
+        if z.holdings:
+            lines.append("**🇮🇳 Zerodha Equity Holdings (CNC):**")
+            lines.append("| Symbol | Qty | Avg Price | Current | P&L |")
+            lines.append("|---|---|---|---|---|")
+            for h in z.holdings[:15]:  # Top 15 holdings to fit Discord message limit
+                sign = "+" if h.pnl > 0 else ""
+                lines.append(
+                    f"| **{h.symbol}** | {h.quantity:.0f} | ₹{h.average_price:,.1f} | ₹{h.last_price:,.1f} | {sign}₹{h.pnl:,.2f} ({h.pnl_pct}%) |"
+                )
+            if len(z.holdings) > 15:
+                lines.append(f"... and {len(z.holdings) - 15} more holdings.\n")
+            else:
+                lines.append("")
+
+        # 2. Zerodha F&O Derivatives
+        if z.fno_positions:
+            lines.append("**🇮🇳 Zerodha F&O Derivatives:**")
+            lines.append("| Symbol | Side | Qty | Entry | Current | P&L |")
+            lines.append("|---|---|---|---|---|---|")
+            for p in z.fno_positions:
+                sign = "+" if p.pnl > 0 else ""
+                lines.append(
+                    f"| **{p.symbol}** | `{p.side}` | {p.quantity:.0f} | ₹{p.entry_price:,.1f} | ₹{p.current_price:,.1f} | {sign}₹{p.pnl:,.2f} |"
+                )
+            lines.append("")
+
+        # 3. Zerodha MCX Commodities
+        if z.commodity_positions:
+            lines.append("**🪙 Zerodha MCX Commodities:**")
+            lines.append("| Symbol | Side | Qty | Entry | Current | P&L |")
+            lines.append("|---|---|---|---|---|---|")
+            for p in z.commodity_positions:
+                sign = "+" if p.pnl > 0 else ""
+                lines.append(
+                    f"| **{p.symbol}** | `{p.side}` | {p.quantity:.0f} | ₹{p.entry_price:,.1f} | ₹{p.current_price:,.1f} | {sign}₹{p.pnl:,.2f} |"
+                )
+            lines.append("")
+
+        # 4. Delta Futures
+        if d_fut.open_positions:
+            lines.append("**🌐 Delta Exchange — Futures Account:**")
+            lines.append("| Symbol | Side | Qty | Entry | Mark | P&L |")
+            lines.append("|---|---|---|---|---|---|")
+            for p in d_fut.open_positions:
+                sign = "+" if p.pnl > 0 else ""
+                lines.append(
+                    f"| **{p.symbol}** | `{p.side}` | {p.quantity} | ${p.entry_price:,.2f} | ${p.current_price:,.2f} | {sign}${p.pnl:,.2f} |"
+                )
+            lines.append("")
+
+        # 5. Delta Options
+        if d_opt.open_positions:
+            lines.append("**🌐 Delta Exchange — Options Account:**")
+            lines.append("| Symbol | Side | Qty | Entry | Mark | P&L |")
+            lines.append("|---|---|---|---|---|---|")
+            for p in d_opt.open_positions:
+                sign = "+" if p.pnl > 0 else ""
+                lines.append(
+                    f"| **{p.symbol}** | `{p.side}` | {p.quantity:.0f} | ${p.entry_price:,.2f} | ${p.current_price:,.2f} | {sign}${p.pnl:,.2f} |"
+                )
+            lines.append("")
+
+        if (
+            not z.holdings
+            and not z.fno_positions
+            and not z.commodity_positions
+            and not d_fut.open_positions
+            and not d_opt.open_positions
+        ):
             await interaction.response.send_message(
-                "ℹ️ **No active open positions** across Zerodha or Delta Exchange at this moment.",
+                "ℹ️ **No active positions or holdings** found across Zerodha or Delta Exchange.",
                 ephemeral=True,
             )
             return
 
-        lines = ["### 📋 Comprehensive Open Positions Breakdown\n"]
-        lines.append("| Exchange | Symbol | Side | Qty | Entry | Current | P&L |")
-        lines.append("|---|---|---|---|---|---|---|")
-
-        for p in all_positions:
-            sym_curr = "₹" if p.exchange == "NSE" else "$"
-            sign = "+" if p.pnl > 0 else ""
-            lines.append(
-                f"| `{p.exchange}` | **{p.symbol}** | `{p.side}` | `{p.quantity}` | "
-                f"{sym_curr}{p.entry_price:,.1f} | {sym_curr}{p.current_price:,.1f} | "
-                f"**{sign}{sym_curr}{p.pnl:,.2f}** ({p.pnl_pct}%) |"
-            )
-
         text = "\n".join(lines)
-        # Discord limit is 2000 chars per message
         if len(text) > 1900:
-            text = text[:1900] + "\n...*(truncated)*"
+            text = text[:1900] + "\n...*(truncated to fit message limit)*"
 
         await interaction.response.send_message(text, ephemeral=True)
 
@@ -95,7 +150,6 @@ class DashboardView(discord.ui.View):
         custom_id="btn_pi_health",
     )
     async def btn_health(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Send detailed systemd & OS diagnostic card (ephemeral)."""
         snapshot = self.get_latest_snapshot()
         sys = snapshot.system
 
