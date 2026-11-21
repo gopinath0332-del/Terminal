@@ -4,9 +4,11 @@
 # Automated Deployment Script for Algo Dashboard on Raspberry Pi 5
 # ==============================================================================
 
-set -euo pipefail
+set -eu
 
-APP_DIR="${HOME}/algo-dashboard"
+# Auto-detect project root directory (works in both sh and bash)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SERVICE_NAME="algo-dashboard"
 USER_NAME="$(whoami)"
 
@@ -19,7 +21,7 @@ mkdir -p "${APP_DIR}/data"
 
 # 1. Ensure Python 3 virtual environment
 if [ ! -d "${APP_DIR}/venv" ]; then
-    echo "📦 Creating Python virtual environment..."
+    echo "📦 Creating Python virtual environment in ${APP_DIR}/venv..."
     python3 -m venv "${APP_DIR}/venv"
 fi
 
@@ -38,10 +40,9 @@ fi
 echo "⚙️  Installing systemd service /etc/systemd/system/${SERVICE_NAME}.service..."
 sudo cp "${APP_DIR}/deploy/${SERVICE_NAME}.service" "/etc/systemd/system/"
 
-if [ "${USER_NAME}" != "pi" ]; then
-    sudo sed -i "s|User=pi|User=${USER_NAME}|g" "/etc/systemd/system/${SERVICE_NAME}.service"
-    sudo sed -i "s|/home/pi|${HOME}|g" "/etc/systemd/system/${SERVICE_NAME}.service"
-fi
+# Adapt paths and user in the installed service file
+sudo sed -i "s|/home/pi/algo-dashboard|${APP_DIR}|g" "/etc/systemd/system/${SERVICE_NAME}.service"
+sudo sed -i "s|User=pi|User=${USER_NAME}|g" "/etc/systemd/system/${SERVICE_NAME}.service"
 
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}.service"
@@ -49,8 +50,9 @@ sudo systemctl enable "${SERVICE_NAME}.service"
 echo ""
 echo "=========================================================="
 echo "✅ Deployment Complete!"
-echo "   To start the service:"
-echo "     sudo systemctl start ${SERVICE_NAME}"
-echo "   To view live logs:"
-echo "     journalctl -u ${SERVICE_NAME} -f"
+echo "   1. Ensure ${APP_DIR}/.env has your DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID."
+echo "   2. Start the service:"
+echo "      sudo systemctl start ${SERVICE_NAME}"
+echo "   3. View live logs:"
+echo "      journalctl -u ${SERVICE_NAME} -f"
 echo "=========================================================="
