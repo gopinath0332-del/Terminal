@@ -58,6 +58,7 @@ class AlgoDashboardBot(discord.Client):
         df_creds = config.get_delta_futures_creds()
         self.delta_futures_collector = DeltaAccountCollector(
             account_label="Delta Futures",
+            account_type="FUTURES",
             api_key=df_creds["api_key"],
             api_secret=df_creds["api_secret"],
             base_url=df_creds["base_url"],
@@ -67,6 +68,7 @@ class AlgoDashboardBot(discord.Client):
         dopt_creds = config.get_delta_options_creds()
         self.delta_options_collector = DeltaAccountCollector(
             account_label="Delta Short Straddle",
+            account_type="OPTIONS",
             api_key=dopt_creds["api_key"],
             api_secret=dopt_creds["api_secret"],
             base_url=dopt_creds["base_url"],

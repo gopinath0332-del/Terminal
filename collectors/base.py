@@ -91,8 +91,8 @@ class ZerodhaData:
 @dataclass
 class DeltaAccountData:
     """Delta Exchange Account Data (Futures or Options)."""
-    account_label: str   # "Delta Futures Account" or "Delta Options Account"
-    account_type: str    # "FUTURES" or "OPTIONS"
+    account_label: str = "Delta Account"
+    account_type: str = "FUTURES"
     is_authenticated: bool = False
     is_testnet: bool = False
 

@@ -32,8 +32,10 @@ class DeltaAccountCollector:
         api_key: str,
         api_secret: str,
         base_url: str = "https://api.india.delta.exchange",
+        account_type: str = "FUTURES",
     ):
         self.account_label = account_label
+        self.account_type = account_type
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
         self.base_url = base_url.rstrip("/")
@@ -89,6 +91,7 @@ class DeltaAccountCollector:
         """Fetch open positions and wallet equity for this account."""
         data = DeltaAccountData(
             account_label=self.account_label,
+            account_type=self.account_type,
             is_testnet=self.is_testnet,
         )
 
