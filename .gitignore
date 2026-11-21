@@ -1,0 +1,15 @@
+# Environment secrets
+.env
+*.token
+serviceAccountKey*.json
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# State files
+data/dashboard_state.json
