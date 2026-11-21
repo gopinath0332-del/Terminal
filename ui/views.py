@@ -2,18 +2,40 @@
 ui/views.py
 ===========
 Interactive Discord Buttons attached to the Exchange-Wise live dashboard embed.
+Renders clean, polished, human-readable Discord Embeds for detailed positions.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, Coroutine, Any
+from typing import Callable, Coroutine, Any, List
 
 import discord
 
-from collectors.base import DashboardSnapshot
+from collectors.base import DashboardSnapshot, PositionItem, HoldingItem
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_curr(val: float, sym: str = "₹") -> str:
+    """Format currency with sign before the symbol: +₹500.00 or -₹500.00."""
+    sign = "+" if val > 0 else ("-" if val < 0 else "")
+    return f"{sign}{sym}{abs(val):,.2f}"
+
+
+def _fmt_qty(qty: float) -> str:
+    """Clean integer or decimal quantity."""
+    abs_q = abs(qty)
+    return f"{int(abs_q):,}" if abs_q.is_integer() else f"{abs_q:,.2f}"
+
+
+def _dot(val: float) -> str:
+    """Return green/red indicator dot."""
+    if val > 0:
+        return "🟢"
+    elif val < 0:
+        return "🔴"
+    return "⚪"
 
 
 class DashboardView(discord.ui.View):
@@ -53,95 +75,111 @@ class DashboardView(discord.ui.View):
         custom_id="btn_view_positions",
     )
     async def btn_positions(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Send a detailed categorized breakdown of all holdings & positions across all exchanges."""
+        """Send a beautifully formatted, highly legible card of all positions & holdings."""
         snapshot = self.get_latest_snapshot()
         z = snapshot.zerodha
         d_fut = snapshot.delta_futures
         d_opt = snapshot.delta_options
 
-        lines = ["### 📋 Comprehensive Exchange-Wise Breakdown\n"]
+        embed = discord.Embed(
+            title="📋 Comprehensive Portfolio & Positions Breakdown",
+            description=f"**Node:** Raspberry Pi 5 • **As of:** {snapshot.timestamp.strftime('%H:%M:%S IST')}",
+            color=0x33B5E5,
+        )
 
-        # 1. Zerodha Holdings
+        has_any_data = False
+
+        # -------------------------------------------------------------
+        # 1. Zerodha Stock Holdings
+        # -------------------------------------------------------------
         if z.holdings:
-            lines.append("**🇮🇳 Zerodha Equity Holdings (CNC):**")
-            lines.append("| Symbol | Qty | Avg Price | Current | P&L |")
-            lines.append("|---|---|---|---|---|")
-            for h in z.holdings[:15]:  # Top 15 holdings to fit Discord message limit
-                sign = "+" if h.pnl > 0 else ""
-                lines.append(
-                    f"| **{h.symbol}** | {h.quantity:.0f} | ₹{h.average_price:,.1f} | ₹{h.last_price:,.1f} | {sign}₹{h.pnl:,.2f} ({h.pnl_pct}%) |"
+            has_any_data = True
+            h_lines: List[str] = []
+            for h in z.holdings[:12]:
+                h_lines.append(
+                    f"{_dot(h.pnl)} **{h.symbol}** ({_fmt_qty(h.quantity)} shares)\n"
+                    f"   Avg: ₹{h.average_price:,.1f} ➔ CMP: ₹{h.last_price:,.1f} • **{_fmt_curr(h.pnl, '₹')}** ({h.pnl_pct:+.1f}%)"
                 )
-            if len(z.holdings) > 15:
-                lines.append(f"... and {len(z.holdings) - 15} more holdings.\n")
-            else:
-                lines.append("")
+            if len(z.holdings) > 12:
+                h_lines.append(f"*... and {len(z.holdings) - 12} more holdings.*")
 
-        # 2. Zerodha F&O Derivatives
-        if z.fno_positions:
-            lines.append("**🇮🇳 Zerodha F&O Derivatives:**")
-            lines.append("| Symbol | Side | Qty | Entry | Current | P&L |")
-            lines.append("|---|---|---|---|---|---|")
-            for p in z.fno_positions:
-                sign = "+" if p.pnl > 0 else ""
-                lines.append(
-                    f"| **{p.symbol}** | `{p.side}` | {p.quantity:.0f} | ₹{p.entry_price:,.1f} | ₹{p.current_price:,.1f} | {sign}₹{p.pnl:,.2f} |"
-                )
-            lines.append("")
+            total_h_pnl = _fmt_curr(z.holdings_total_pnl, "₹")
+            field_name = f"🇮🇳 Zerodha Equity Holdings ({len(z.holdings)} stocks • {total_h_pnl})"
+            embed.add_field(name=field_name, value="\n".join(h_lines), inline=False)
 
-        # 3. Zerodha MCX Commodities
+        # -------------------------------------------------------------
+        # 2. Zerodha MCX Commodities
+        # -------------------------------------------------------------
         if z.commodity_positions:
-            lines.append("**🪙 Zerodha MCX Commodities:**")
-            lines.append("| Symbol | Side | Qty | Entry | Current | P&L |")
-            lines.append("|---|---|---|---|---|---|")
+            has_any_data = True
+            comm_lines: List[str] = []
+            comm_total_pnl = sum(p.pnl for p in z.commodity_positions)
             for p in z.commodity_positions:
-                sign = "+" if p.pnl > 0 else ""
-                lines.append(
-                    f"| **{p.symbol}** | `{p.side}` | {p.quantity:.0f} | ₹{p.entry_price:,.1f} | ₹{p.current_price:,.1f} | {sign}₹{p.pnl:,.2f} |"
+                side_label = "BUY" if p.quantity > 0 else "SELL"
+                comm_lines.append(
+                    f"{_dot(p.pnl)} **{p.symbol}** • `{side_label} {_fmt_qty(p.quantity)}`\n"
+                    f"   Entry: ₹{p.entry_price:,.1f} ➔ CMP: ₹{p.current_price:,.1f} • **{_fmt_curr(p.pnl, '₹')}**"
                 )
-            lines.append("")
+            field_name = f"🪙 Zerodha MCX Commodities ({len(z.commodity_positions)} contracts • {_fmt_curr(comm_total_pnl, '₹')})"
+            embed.add_field(name=field_name, value="\n".join(comm_lines), inline=False)
 
-        # 4. Delta Futures
+        # -------------------------------------------------------------
+        # 3. Zerodha F&O Derivatives (NFO Options/Futures)
+        # -------------------------------------------------------------
+        if z.fno_positions:
+            has_any_data = True
+            fno_lines: List[str] = []
+            fno_total_pnl = sum(p.pnl for p in z.fno_positions)
+            for p in z.fno_positions:
+                side_label = "BUY" if p.quantity > 0 else "SELL"
+                fno_lines.append(
+                    f"{_dot(p.pnl)} **{p.symbol}** • `{side_label} {_fmt_qty(p.quantity)}`\n"
+                    f"   Entry: ₹{p.entry_price:,.1f} ➔ LTP: ₹{p.current_price:,.1f} • **{_fmt_curr(p.pnl, '₹')}**"
+                )
+            field_name = f"📈 Zerodha F&O Derivatives ({len(z.fno_positions)} positions • {_fmt_curr(fno_total_pnl, '₹')})"
+            embed.add_field(name=field_name, value="\n".join(fno_lines), inline=False)
+
+        # -------------------------------------------------------------
+        # 4. Delta Exchange — Futures Account
+        # -------------------------------------------------------------
         if d_fut.open_positions:
-            lines.append("**🌐 Delta Exchange — Futures Account:**")
-            lines.append("| Symbol | Side | Qty | Entry | Mark | P&L |")
-            lines.append("|---|---|---|---|---|---|")
+            has_any_data = True
+            fut_lines: List[str] = []
+            fut_total_pnl = sum(p.pnl for p in d_fut.open_positions)
             for p in d_fut.open_positions:
-                sign = "+" if p.pnl > 0 else ""
-                lines.append(
-                    f"| **{p.symbol}** | `{p.side}` | {p.quantity} | ${p.entry_price:,.2f} | ${p.current_price:,.2f} | {sign}${p.pnl:,.2f} |"
+                side_label = p.side.upper()
+                fut_lines.append(
+                    f"{_dot(p.pnl)} **{p.symbol}** • `{side_label} {_fmt_qty(p.quantity)}`\n"
+                    f"   Entry: ${p.entry_price:,.2f} ➔ Mark: ${p.current_price:,.2f} • **{_fmt_curr(p.pnl, '$')}**"
                 )
-            lines.append("")
+            field_name = f"🌐 Delta Crypto Futures ({len(d_fut.open_positions)} positions • {_fmt_curr(fut_total_pnl, '$')})"
+            embed.add_field(name=field_name, value="\n".join(fut_lines), inline=False)
 
-        # 5. Delta Options
+        # -------------------------------------------------------------
+        # 5. Delta Exchange — Options Account
+        # -------------------------------------------------------------
         if d_opt.open_positions:
-            lines.append("**🌐 Delta Exchange — Options Account:**")
-            lines.append("| Symbol | Side | Qty | Entry | Mark | P&L |")
-            lines.append("|---|---|---|---|---|---|")
+            has_any_data = True
+            opt_lines: List[str] = []
+            opt_total_pnl = sum(p.pnl for p in d_opt.open_positions)
             for p in d_opt.open_positions:
-                sign = "+" if p.pnl > 0 else ""
-                lines.append(
-                    f"| **{p.symbol}** | `{p.side}` | {p.quantity:.0f} | ${p.entry_price:,.2f} | ${p.current_price:,.2f} | {sign}${p.pnl:,.2f} |"
+                side_label = p.side.upper()
+                opt_lines.append(
+                    f"{_dot(p.pnl)} **{p.symbol}** • `{side_label} {_fmt_qty(p.quantity)}`\n"
+                    f"   Entry: ${p.entry_price:,.2f} ➔ Mark: ${p.current_price:,.2f} • **{_fmt_curr(p.pnl, '$')}**"
                 )
-            lines.append("")
+            field_name = f"🌐 Delta Crypto Options ({len(d_opt.open_positions)} positions • {_fmt_curr(opt_total_pnl, '$')})"
+            embed.add_field(name=field_name, value="\n".join(opt_lines), inline=False)
 
-        if (
-            not z.holdings
-            and not z.fno_positions
-            and not z.commodity_positions
-            and not d_fut.open_positions
-            and not d_opt.open_positions
-        ):
+        if not has_any_data:
             await interaction.response.send_message(
-                "ℹ️ **No active positions or holdings** found across Zerodha or Delta Exchange.",
+                "ℹ️ **No active positions or holdings** currently open across Zerodha or Delta Exchange.",
                 ephemeral=True,
             )
             return
 
-        text = "\n".join(lines)
-        if len(text) > 1900:
-            text = text[:1900] + "\n...*(truncated to fit message limit)*"
-
-        await interaction.response.send_message(text, ephemeral=True)
+        embed.set_footer(text="Private view • Only visible to you")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(
         label="Pi Health",
@@ -161,10 +199,10 @@ class DashboardView(discord.ui.View):
 
         temp_str = f"{sys.temperature_c:.1f}°C" if sys.temperature_c is not None else "N/A"
         embed.add_field(
-            name="Hardware Resources",
+            name="🖥️ Hardware Utilization",
             value=(
-                f"• **CPU Usage:** `{sys.cpu_percent}%`\n"
-                f"• **RAM Memory:** `{sys.ram_used_gb} / {sys.ram_total_gb} GB ({sys.ram_percent}%)`\n"
+                f"• **CPU Load:** `{sys.cpu_percent:.1f}%`\n"
+                f"• **RAM Memory:** `{sys.ram_used_gb} / {sys.ram_total_gb} GB` ({sys.ram_percent}%)\n"
                 f"• **Disk Usage:** `{sys.disk_percent}%`\n"
                 f"• **SoC Temperature:** `{temp_str}`"
             ),
@@ -176,7 +214,7 @@ class DashboardView(discord.ui.View):
         d_opt = snapshot.delta_options
 
         embed.add_field(
-            name="Systemd Service Daemon Health",
+            name="🤖 Algo Daemon Services",
             value=(
                 f"• `{z.nifty_strike_status.name}`: `{z.nifty_strike_status.status.upper()}`\n"
                 f"• `{z.nifty_portfolio_status.name}`: `{z.nifty_portfolio_status.status.upper()}`\n"
